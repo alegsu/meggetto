@@ -3,7 +3,9 @@ import axios from "axios";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// 🔹 Cerca prodotti
+/**
+ * 🔹 Cerca prodotti WooCommerce per query, taglia e colore
+ */
 async function searchProducts(query, size, color, { debug = false } = {}) {
   try {
     const url = new URL(`${process.env.WOO_URL}/products`);
@@ -28,48 +30,57 @@ async function searchProducts(query, size, color, { debug = false } = {}) {
       url: p.permalink,
     }));
 
-    return { results };
+    return debug ? { results, meta: { url: url.toString(), count: results.length } } : { results };
   } catch (err) {
     console.error(err.response?.data || err.message);
     return { results: [] };
   }
 }
 
-// 🔹 Controlla quantità stock di una variante
-async function checkStock(productUrl, size) {
+/**
+ * 🔹 Controlla la disponibilità di un prodotto in una taglia specifica
+ * Può ricevere productId o productUrl
+ */
+async function checkStock({ productUrl, productId, size }) {
   try {
-    // 1. Ricava lo slug dall'URL (es. /shop/687174006007black/ -> 687174006007black)
-    const slug = productUrl.split("/").filter(Boolean).pop();
+    let finalProductId = productId;
 
-    // 2. Trova l'ID del prodotto da WooCommerce
-    const productResp = await axios.get(`${process.env.WOO_URL}/products`, {
-      auth: {
-        username: process.env.WC_KEY,
-        password: process.env.WC_SECRET,
-      },
-      params: { slug }
-    });
+    // Se non ho ID ma ho l'URL, ricavo slug → ID
+    if (!finalProductId && productUrl) {
+      const slug = productUrl.split("/").filter(Boolean).pop();
+      const productResp = await axios.get(`${process.env.WOO_URL}/products`, {
+        auth: {
+          username: process.env.WC_KEY,
+          password: process.env.WC_SECRET,
+        },
+        params: { slug },
+      });
 
-    if (!productResp.data.length) {
-      return { error: `Prodotto non trovato per slug: ${slug}` };
+      if (!productResp.data.length) {
+        return { error: `Prodotto non trovato per slug: ${slug}` };
+      }
+      finalProductId = productResp.data[0].id;
     }
 
-    const productId = productResp.data[0].id;
+    if (!finalProductId) {
+      return { error: "Serve almeno un productId o un productUrl" };
+    }
 
-    // 3. Recupera le varianti del prodotto
-    const varResp = await axios.get(`${process.env.WOO_URL}/products/${productId}/variations`, {
+    // Recupera varianti del prodotto
+    const varResp = await axios.get(`${process.env.WOO_URL}/products/${finalProductId}/variations`, {
       auth: {
         username: process.env.WC_KEY,
         password: process.env.WC_SECRET,
       },
-      params: { per_page: 50 }
+      params: { per_page: 50 },
     });
 
-    // 4. Cerca la variante con la taglia richiesta
-    const variation = varResp.data.find(v =>
-      v.attributes.some(a =>
-        a.name.toLowerCase().includes("taglia") &&
-        a.option.toLowerCase() === size.toLowerCase()
+    // Cerca la variante con la taglia richiesta
+    const variation = varResp.data.find((v) =>
+      v.attributes.some(
+        (a) =>
+          a.name.toLowerCase().includes("taglia") &&
+          a.option.toLowerCase() === size.toLowerCase()
       )
     );
 
@@ -78,35 +89,38 @@ async function checkStock(productUrl, size) {
     }
 
     return {
-      product: productResp.data[0].name,
-      size: size,
+      productId: finalProductId,
+      product: variation.name || "",
+      size,
       stock_quantity: variation.stock_quantity ?? null,
       stock_status: variation.stock_status,
       sku: variation.sku,
     };
-
   } catch (err) {
     console.error(err.response?.data || err.message);
     return { error: "Errore durante il check stock" };
   }
 }
 
+/**
+ * 🔹 Endpoint principale
+ */
 export default async function handler(req, res) {
-  const { message, q, size, color, url, debug } = req.query;
+  const { message, q, size, color, url, productId, debug } = req.query;
 
-  // 🔎 Endpoint diretto per debug stock
-  if (url && size) {
-    const data = await checkStock(url, size);
+  // 🟢 Debug diretto stock (senza AI)
+  if ((url || productId) && size) {
+    const data = await checkStock({ productUrl: url, productId, size });
     return res.status(200).json(data);
   }
 
-  // 🔎 Endpoint diretto per debug search
+  // 🟢 Debug diretto search (senza AI)
   if (q) {
     const data = await searchProducts(q, size, color, { debug: !!debug });
     return res.status(200).json(data);
   }
 
-  // 🧠 AI con function calling
+  // 🧠 Percorso AI con function calling
   const functions = [
     {
       name: "search_products",
@@ -116,10 +130,10 @@ export default async function handler(req, res) {
         properties: {
           query: { type: "string" },
           size: { type: "string" },
-          color: { type: "string" }
+          color: { type: "string" },
         },
-        required: ["query"]
-      }
+        required: ["query"],
+      },
     },
     {
       name: "check_stock",
@@ -127,19 +141,20 @@ export default async function handler(req, res) {
       parameters: {
         type: "object",
         properties: {
-          productUrl: { type: "string", description: "URL del prodotto su WooCommerce" },
-          size: { type: "string", description: "Taglia da verificare (es. 44)" }
+          productUrl: { type: "string", description: "URL del prodotto WooCommerce" },
+          productId: { type: "number", description: "ID numerico del prodotto WooCommerce" },
+          size: { type: "string", description: "Taglia da verificare (es. 44)" },
         },
-        required: ["productUrl", "size"]
-      }
-    }
+        required: ["size"],
+      },
+    },
   ];
 
   const chat = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [{ role: "user", content: message || "" }],
     functions,
-    function_call: "auto"
+    function_call: "auto",
   });
 
   const fnCall = chat.choices?.[0]?.message?.function_call;
@@ -152,9 +167,11 @@ export default async function handler(req, res) {
 
   if (fnCall?.name === "check_stock") {
     const args = JSON.parse(fnCall.arguments || "{}");
-    const data = await checkStock(args.productUrl, args.size);
+    const data = await checkStock(args);
     return res.status(200).json(data);
   }
 
-  return res.status(200).json({ reply: chat.choices?.[0]?.message?.content || "" });
+  return res.status(200).json({
+    reply: chat.choices?.[0]?.message?.content || "Nessuna risposta dall'assistente",
+  });
 }
