@@ -3,26 +3,24 @@ import axios from "axios";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// 🔹 Cerca prodotti
 async function searchProducts(query, size, color, { debug = false } = {}) {
   try {
     const url = new URL(`${process.env.WOO_URL}/products`);
     url.searchParams.set("search", query || "");
     url.searchParams.set("per_page", "5");
 
-    // 👉 WooCommerce vuole parametri attribute ripetuti, NON attribute[]
     if (color) url.searchParams.append("attribute", `pa_colore=${color}`);
-    if (size)  url.searchParams.append("attribute", `pa_taglia=${size}`);
+    if (size) url.searchParams.append("attribute", `pa_taglia=${size}`);
 
-    const finalUrl = url.toString();
-
-    const response = await axios.get(finalUrl, {
+    const response = await axios.get(url.toString(), {
       auth: {
         username: process.env.WC_KEY,
         password: process.env.WC_SECRET,
       },
     });
 
-    const results = response.data.map(p => ({
+    const results = response.data.map((p) => ({
       id: p.id,
       name: p.name,
       price: p.price,
@@ -30,24 +28,85 @@ async function searchProducts(query, size, color, { debug = false } = {}) {
       url: p.permalink,
     }));
 
-    return debug ? { results, meta: { finalUrl, count: results.length } } : { results };
+    return { results };
   } catch (err) {
-    const error = err.response?.data || err.message;
-    if (debug) return { results: [], meta: { error } };
+    console.error(err.response?.data || err.message);
     return { results: [] };
   }
 }
 
-export default async function handler(req, res) {
-  const { message, q, size, color, debug } = req.query;
+// 🔹 Controlla quantità stock di una variante
+async function checkStock(productUrl, size) {
+  try {
+    // 1. Ricava lo slug dall'URL (es. /shop/687174006007black/ -> 687174006007black)
+    const slug = productUrl.split("/").filter(Boolean).pop();
 
-  // 🔎 Bypass AI: consente test diretti con ?q=&size=&color=
+    // 2. Trova l'ID del prodotto da WooCommerce
+    const productResp = await axios.get(`${process.env.WOO_URL}/products`, {
+      auth: {
+        username: process.env.WC_KEY,
+        password: process.env.WC_SECRET,
+      },
+      params: { slug }
+    });
+
+    if (!productResp.data.length) {
+      return { error: `Prodotto non trovato per slug: ${slug}` };
+    }
+
+    const productId = productResp.data[0].id;
+
+    // 3. Recupera le varianti del prodotto
+    const varResp = await axios.get(`${process.env.WOO_URL}/products/${productId}/variations`, {
+      auth: {
+        username: process.env.WC_KEY,
+        password: process.env.WC_SECRET,
+      },
+      params: { per_page: 50 }
+    });
+
+    // 4. Cerca la variante con la taglia richiesta
+    const variation = varResp.data.find(v =>
+      v.attributes.some(a =>
+        a.name.toLowerCase().includes("taglia") &&
+        a.option.toLowerCase() === size.toLowerCase()
+      )
+    );
+
+    if (!variation) {
+      return { error: `Nessuna variante trovata con taglia ${size}` };
+    }
+
+    return {
+      product: productResp.data[0].name,
+      size: size,
+      stock_quantity: variation.stock_quantity ?? null,
+      stock_status: variation.stock_status,
+      sku: variation.sku,
+    };
+
+  } catch (err) {
+    console.error(err.response?.data || err.message);
+    return { error: "Errore durante il check stock" };
+  }
+}
+
+export default async function handler(req, res) {
+  const { message, q, size, color, url, debug } = req.query;
+
+  // 🔎 Endpoint diretto per debug stock
+  if (url && size) {
+    const data = await checkStock(url, size);
+    return res.status(200).json(data);
+  }
+
+  // 🔎 Endpoint diretto per debug search
   if (q) {
     const data = await searchProducts(q, size, color, { debug: !!debug });
     return res.status(200).json(data);
   }
 
-  // 🧠 Percorso con AI + function calling
+  // 🧠 AI con function calling
   const functions = [
     {
       name: "search_products",
@@ -60,6 +119,18 @@ export default async function handler(req, res) {
           color: { type: "string" }
         },
         required: ["query"]
+      }
+    },
+    {
+      name: "check_stock",
+      description: "Verifica la disponibilità di un prodotto in una taglia specifica",
+      parameters: {
+        type: "object",
+        properties: {
+          productUrl: { type: "string", description: "URL del prodotto su WooCommerce" },
+          size: { type: "string", description: "Taglia da verificare (es. 44)" }
+        },
+        required: ["productUrl", "size"]
       }
     }
   ];
@@ -76,6 +147,12 @@ export default async function handler(req, res) {
   if (fnCall?.name === "search_products") {
     const args = JSON.parse(fnCall.arguments || "{}");
     const data = await searchProducts(args.query, args.size, args.color, { debug: !!debug });
+    return res.status(200).json(data);
+  }
+
+  if (fnCall?.name === "check_stock") {
+    const args = JSON.parse(fnCall.arguments || "{}");
+    const data = await checkStock(args.productUrl, args.size);
     return res.status(200).json(data);
   }
 
