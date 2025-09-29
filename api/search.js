@@ -5,22 +5,33 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 async function searchProducts(query, size, color) {
   try {
+    const params = {
+      search: query,
+      per_page: 5
+    };
+
+    if (size) {
+      params["attribute"] = `pa_taglia=${size}`;
+    }
+    if (color) {
+      // Se già presente un attribute, aggiungiamo come array
+      if (!params["attribute"]) {
+        params["attribute"] = `pa_colore=${color}`;
+      } else {
+        // WooCommerce accetta più parametri attribute[] in querystring
+        params["attribute[]"] = [`pa_taglia=${size}`, `pa_colore=${color}`];
+      }
+    }
+
     const response = await axios.get(`${process.env.WOO_URL}/products`, {
       auth: {
         username: process.env.WC_KEY,
         password: process.env.WC_SECRET
       },
-      params: { search: query, per_page: 5 }
+      params
     });
 
-    const products = response.data.filter(p => {
-      const attrs = p.attributes.map(a => a.option.toLowerCase());
-      const okSize = size ? attrs.includes(size.toLowerCase()) : true;
-      const okColor = color ? attrs.includes(color.toLowerCase()) : true;
-      return okSize && okColor;
-    });
-
-    return products.map(p => ({
+    return response.data.map(p => ({
       id: p.id,
       name: p.name,
       price: p.price,
@@ -32,6 +43,7 @@ async function searchProducts(query, size, color) {
     return [];
   }
 }
+
 
 export default async function handler(req, res) {
   const { message } = req.query;
