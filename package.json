@@ -1,0 +1,9 @@
+{
+  "name": "woo-ai-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "openai": "^4.0.0",
+    "axios": "^1.6.0"
+  }
+}
